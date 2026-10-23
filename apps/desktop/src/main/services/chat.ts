@@ -6,6 +6,7 @@ import { resolve as resolvePath } from 'node:path'
 import { streamChat } from '../providers'
 import {
   isEffortLevel,
+  type BrokenCallCause,
   type ContentPart,
   type EffortLevel,
   type Message,
@@ -86,6 +87,7 @@ import {
 } from './chat-store'
 import { trimHistoryImages } from './image-trim'
 import { ATTACH_TEXT_PREFIX, buildAttachmentPart } from './attachments'
+import { isEn } from '../locale'
 import {
   applyFiles,
   buildRestoreNote,
@@ -210,6 +212,15 @@ interface ChatSetFocusRequest {
   sessionId: string
   focusRoot: string | null
 }
+
+/** 重命名对话（立即落库）；title 为空即恢复自动标题。见 chat:rename-session。 */
+interface ChatRenameSessionRequest {
+  sessionId: string
+  title: string
+}
+
+/** 用户自定的对话标题上限（列表里单行省略显示，再长也看不全）。 */
+const TITLE_MAX = 100
 
 /** 角色名片草稿：propose_agent 原始参数归一化后的形状（编辑器/名片消费）。 */
 export interface AgentDraft {
@@ -352,7 +363,7 @@ export type DisplayMessage =
 
 /** StoredNotice → 展示块（错误红框 / 弱化提示）。 */
 function noticeToBlock(nt: StoredNotice): DisplayBlock {
-  if (nt.kind === 'error') return { kind: 'error', message: nt.message ?? '请求失败。' }
+  if (nt.kind === 'error') return { kind: 'error', message: nt.message ?? (isEn() ? 'Request failed.' : '请求失败。') }
   return { kind: 'notice', code: nt.code ?? 'empty' }
 }
 
@@ -1131,9 +1142,10 @@ const EMPTY_NUDGE =
   '如果任务已经完成，请简要告诉用户结果；如果确实需要用户决定，请用 ask_user 提问。'
 
 /**
- * 工具参数撞上输出上限被截断（适配器报 tool_call_truncated）：连续这么多步都截断就停下，交回
- * 「已截断」提示。前几次记成失败的工具调用、回灌「请分段写」，模型拆小后自然接着做；一直拆不小
- * （比如每次都在长篇思考上耗光预算）则不再空转。主轮步数不设上限，这道闸必须有。
+ * 工具参数没能完整解析（适配器报 tool_call_truncated：撞上输出上限、被内容策略截断、或参数不是合法
+ * JSON）：连续这么多步都如此就停下，交回「已截断」提示。前几次记成失败的工具调用、回灌纠正提示，
+ * 模型拆小后自然接着做；一直拆不小（比如每次都在长篇思考上耗光预算）则不再空转。主轮步数不设上限，
+ * 这道闸必须有。
  */
 const MAX_TRUNCATED_STREAK = 4
 /** 写进被截断调用 tool_use 里的标记：展示层据此一律画成普通工具卡（它不是能被答复的问答 / 计划 / 名片）。 */
@@ -1155,19 +1167,45 @@ function truncatedCallInput(partialArgs: string): Record<string, unknown> {
   return { ...(path ? { path } : {}), [TRUNCATED_FLAG]: true }
 }
 
+/** 参数残缺调用的工具卡摘要。 */
+const BROKEN_CALL_LABEL: Record<BrokenCallCause, string> = {
+  max_tokens: '输出超长，未执行',
+  refusal: '内容被拦截，未执行',
+  invalid: '参数无效，未执行'
+}
+
 /**
- * 被截断调用的回灌结果：讲清「没执行、没改动」，并给一个模型能照做的尺度——按它这次写到的字符数
- * 折半（连续第二次截断再折成三分之一），它数不准 token，但能估字符与行数。
+ * 参数残缺调用的回灌结果：讲清「没执行、没改动」及原因，并给一个模型能照做的尺度——按它这次写到的
+ * 字符数折半（连续第二次再折成三分之一），它数不准 token，但能估字符与行数。
  */
-function truncatedCallResult(name: string, partialChars: number, streak: number): string {
+function truncatedCallResult(
+  name: string,
+  partialChars: number,
+  cause: BrokenCallCause,
+  streak: number
+): string {
   const limit = Math.max(1000, Math.floor(partialChars / (streak + 1) / 100) * 100)
-  const again = streak > 1 ? `这已是连续第 ${streak} 次截断，请把每段切得更小。` : ''
+  const split =
+    name === 'write_file'
+      ? '先用 write_file 写入开头一部分，再用 append: true 分次追加其余部分。'
+      : '把内容拆成多次较小的调用依次完成。'
+  if (cause === 'refusal')
+    return (
+      `内容被拦截：本次 ${name} 调用的参数写到约 ${partialChars} 字符时被服务商的内容安全审核拦截，` +
+      `未执行，没有产生任何改动。${streak > 1 ? `这已是连续第 ${streak} 次被拦截。` : ''}` +
+      `可换种表述或拆成更小的几段重试；仍被拦截就停下，告诉用户哪部分内容写不进去。`
+    )
+  if (cause === 'invalid')
+    return (
+      `参数无效：本次 ${name} 调用的参数（约 ${partialChars} 字符）不是完整、合法的 JSON，无法解析，` +
+      `未执行，没有产生任何改动。${streak > 1 ? `这已是连续第 ${streak} 次参数无效，请把每段切得更小。` : ''}` +
+      `参数过长时容易被中途截断，请重新调用并确保参数是合法 JSON；内容较长时请分段完成，` +
+      `每段控制在约 ${limit} 字符以内：${split}`
+    )
   return (
     `输出长度超限：本次 ${name} 调用的参数写到约 ${partialChars} 字符时达到单次回复的输出上限，被截断，` +
-    `未执行，没有产生任何改动。${again}请分段完成，每段控制在约 ${limit} 字符以内：` +
-    (name === 'write_file'
-      ? '先用 write_file 写入开头一部分，再用 append: true 分次追加其余部分。'
-      : '把内容拆成多次较小的调用依次完成。')
+    `未执行，没有产生任何改动。${streak > 1 ? `这已是连续第 ${streak} 次截断，请把每段切得更小。` : ''}` +
+    `请分段完成，每段控制在约 ${limit} 字符以内：${split}`
   )
 }
 
@@ -1495,8 +1533,8 @@ function systemPrompt(
     '【并行调用】一次回复里可以同时发起多个工具调用。彼此没有依赖的调用（如同时读几个文件、同时搜几个关键词、同时看几个目录）务必在**同一次回复里一并发出**，只读调用会并发执行，省去逐个往返；只有后一步要用到前一步结果时才分开依次发起。',
     '【工程纪律】① 只做用户要求的事：不擅自加功能、不做没要求的重构或「顺手优化」，也不为不可能发生的情况堆防御代码；修 bug 就修 bug。② 改代码先读周边：贴合所在文件既有的命名、风格、惯用写法与注释密度，优先复用现有函数与工具，不另起炉灶。③ 如实汇报：改完能验证就验证（跑类型检查、测试或构建）；测试失败就说失败并给出关键输出，跳过了哪步就说跳过了，没验证过的不要说成「已完成、已通过」。④ 提到代码位置时用「路径:行号」的写法，方便用户定位。',
     `【执行与安全边界】写入/修改文件、执行命令都无需任何授权：直接调用对应工具即可，本应用没有授权弹框。文件读写与命令执行均不设任何限制（工作区外、主目录、隐藏目录、.git 均可直接读写，任何命令都会直接执行），删除、覆盖、强推等破坏性操作执行前请自行核对目标无误。切勿在回复文字里询问「是否允许写入 / 是否同意覆盖 / 请确认」之类的话：不存在授权界面，用户也无法用文字给你授权，这只会让任务白白停滞——需要用户拍板时用 ask_user。`,
-    '【决策与澄清】当需求确有歧义、存在多个各有取舍的可行方案需用户抉择、或缺少无法合理默认的关键信息时，调用 ask_user 抛出一个或多个问题（每题可给候选项、可单选或多选，界面另有内置「自己输入」入口），用户在同一张卡片里一次性作答后回灌给你再继续；能合理默认就直接做，别为琐碎选择打断用户。注意区分：ask_user 只用于征求决策/澄清；写入与执行本就无需授权，切勿用它去问「是否允许写入/执行」。',
-    '【计划先行】遇到非平凡的实现类任务（新功能、跨多文件改动、有多个各有取舍的方案、或需求尚不明确等），先用只读工具（read_file / list_dir / glob / grep / web_fetch）充分调研理解现状——调研面较大时（要翻多个目录、追多条调用链、或需摸清一整套既有约定）可先用 `run_subagent` 派发 `Plan` 子智能体在隔离上下文里完成调研并带回方案要点，再由你综合判断——然后调用 `exit_plan` 提交一份面向用户批准的完整实施计划（Markdown）；**在计划获批前不要写入文件或执行命令**。提交前若仍有影响方案的未决问题（包括 Plan 子智能体标注的不确定项），先用 ask_user 问清，得到答复后再提交；计划里不得留有待用户回答的问题，确需假设的写成「默认采用 X」，也不要用 ask_user 询问「计划是否可行」。用户批准后你直接按计划执行、无需再次征求授权；用户若选择继续完善，请依其回复（随结果附上，或在用户下一条消息里）回应、需要时调整后再重新提交，在收到回复前不要重复调用 exit_plan；用户若忽略计划，不要执行也不要重新提交。琐碎、单点、只读或答疑类任务直接做，不必先出计划。',
+    '【决策与澄清】只在卡住时提问：需求确有歧义、存在多个各有取舍的可行方案需用户抉择、或缺少无法合理默认的关键信息，且用户的回答会改变你接下来的做法时，调用 ask_user 抛出一个或多个问题（每题可给候选项、可单选或多选，界面另有内置「自己输入」入口），用户在同一张卡片里一次性作答后回灌给你再继续。能自己查证的事实不要问；有合理默认的选择也不要问——选最合理的一项直接做，并在回复里说明你的选择。注意区分：ask_user 只用于征求决策/澄清；写入与执行本就无需授权，切勿用它去问「是否允许写入/执行」。',
+    '【计划先行】遇到非平凡的实现类任务（新功能、跨多文件改动、有多个各有取舍的方案、或需求尚不明确等），先用只读工具（read_file / list_dir / glob / grep / web_fetch，以及只做查询的 run_command）充分调研理解现状——调研面较大时（要翻多个目录、追多条调用链、或需摸清一整套既有约定）可先用 `run_subagent` 派发 `Plan` 子智能体在隔离上下文里完成调研并带回方案要点，再由你综合判断——然后调用 `exit_plan` 提交一份面向用户批准的完整实施计划（Markdown）；**在计划获批前不要写入文件，也不要执行有副作用的命令**；只做查询的命令可以执行（查版本、查环境变量是否已设置但不打印其值、查服务是否在运行等），借此核实计划依赖的运行环境、凭据、账号等前提，缺了什么在计划里写明，免得执行到一半才发现。提交前若仍有影响方案的未决问题（包括 Plan 子智能体标注的不确定项），先用 ask_user 问清，得到答复后再提交；计划里不得留有待用户回答的问题，确需假设的写成「默认采用 X」，也不要用 ask_user 询问「计划是否可行」。用户批准后你直接按计划执行、无需再次征求授权；用户若选择继续完善，请依其回复（随结果附上，或在用户下一条消息里）回应、需要时调整后再重新提交，在收到回复前不要重复调用 exit_plan；用户若忽略计划，不要执行也不要重新提交。琐碎、单点、只读或答疑类任务直接做，不必先出计划。',
     '【任务清单】执行需要 3 步及以上的任务时（尤其是计划获批后开始执行、或用户一次交代了多件事），先用 `todo_write` 列出待办清单，界面会在输入框上方以进度胶囊实时显示给用户；执行中持续更新：同一时刻只保留一项 in_progress，做完一项立即标为 completed，发现新步骤随时补进清单。每次调用传完整清单。任务被暂停、用户转向别的事而不再进行当前清单时，调用 todo_write 传 cancel: true 取消它。单步、琐碎或纯答疑的任务不要建清单。'
   ]
   // 渐进式披露：清单只有「名称 + 一句话描述」，任务匹配时模型再调用 skill 工具取完整指令。
@@ -2461,7 +2499,7 @@ export function registerChatIpc(getWindow: () => BrowserWindow | null): void {
     // （之后追加的助手输出 / 工具结果不在读数里，由判定函数另行估算补上）。
     let usedInput = 0
     let usedAt = 0
-    // 连续被输出上限截断的步数（见 MAX_TRUNCATED_STREAK）：工具参数截断与「只思考 / 半截正文」截断共用。
+    // 连续被截断的步数（见 MAX_TRUNCATED_STREAK）：工具参数残缺与「只思考 / 半截正文」截断共用。
     let truncatedStreak = 0
     // 本轮已因上下文超限强制压缩重试过（每轮至多一次：压完仍超限说明单步就装不下，再试无益）。
     let contextRetried = false
@@ -2487,8 +2525,14 @@ export function registerChatIpc(getWindow: () => BrowserWindow | null): void {
         usedInput = 0 // 历史已改写，旧读数作废：回退估算，直到本步拿到新读数
 
       let assistantText = ''
-      // truncated = 参数被输出上限截断时已写出的字符数：这种调用只记录、不执行（见下方工具循环）。
-      let toolCalls: { id: string; name: string; args: unknown; truncated?: number }[] = []
+      // truncated = 参数残缺时已写出的字符数、cause = 残缺原因：这种调用只记录、不执行（见下方工具循环）。
+      let toolCalls: {
+        id: string
+        name: string
+        args: unknown
+        truncated?: number
+        cause?: BrokenCallCause
+      }[] = []
       let stopReason: StopReason = 'end_turn'
       // 本步被中止 / 出错打断（而非干净结束）：仍落地已收到的部分，见下方提交段。
       let interrupted: 'aborted' | 'error' | null = null
@@ -2560,11 +2604,17 @@ export function registerChatIpc(getWindow: () => BrowserWindow | null): void {
                 ...(evMeta ?? {})
               })
           } else if (ev.type === 'tool_call_truncated') {
-            // 参数写到一半撞上输出上限：记成一次调用（进历史、画普通工具卡——哪怕是 ask_user /
-            // exit_plan，它们也没法被答复），由工具循环直接回灌「请分段写」，绝不执行。
+            // 参数残缺（撞上输出上限 / 被内容拦截 / 坏 JSON）：记成一次调用（进历史、画普通工具卡——
+            // 哪怕是 ask_user / exit_plan，它们也没法被答复），由工具循环直接回灌纠正提示，绝不执行。
             const id = ev.id || `call_${randomUUID()}`
             const input = truncatedCallInput(ev.partialArgs)
-            toolCalls.push({ id, name: ev.name, args: input, truncated: ev.partialArgs.length })
+            toolCalls.push({
+              id,
+              name: ev.name,
+              args: input,
+              truncated: ev.partialArgs.length,
+              cause: ev.cause
+            })
             emit(turnId, sessionId, {
               type: 'tool_call',
               id,
@@ -2683,7 +2733,9 @@ export function registerChatIpc(getWindow: () => BrowserWindow | null): void {
         }
         if (retryableDrop) {
           if (attempt >= MAX_RECONNECT) {
-            errorMessage = `连接多次中断，已重试 ${MAX_RECONNECT} 次仍失败，已停止。${lastDropReason ? `最后一次错误：${lastDropReason}` : ''}`
+            errorMessage = isEn()
+              ? `The connection kept dropping and ${MAX_RECONNECT} retries failed, so the reply was stopped.${lastDropReason ? ` Last error: ${lastDropReason}` : ''}`
+              : `连接多次中断，已重试 ${MAX_RECONNECT} 次仍失败，已停止。${lastDropReason ? `最后一次错误：${lastDropReason}` : ''}`
             if (!isSub)
               emit(turnId, sessionId, {
                 type: 'error',
@@ -2805,9 +2857,10 @@ export function registerChatIpc(getWindow: () => BrowserWindow | null): void {
         // 余下未执行的由循环后的 fillUnrun 补占位。直接 return 会把 resultParts 整个丢掉。
         if (controller.signal.aborted) break
 
-        // 被输出上限截断的调用：参数残缺，不过闸门、不执行，回灌失败结果让模型分段重来。
+        // 参数残缺的调用：不过闸门、不执行，回灌失败结果让模型分段重来。
         if (tc.truncated !== undefined) {
-          const label = '输出超长，未执行'
+          const cause = tc.cause ?? 'max_tokens'
+          const label = BROKEN_CALL_LABEL[cause]
           args.onToolSummary?.(tc.id, label)
           emit(turnId, sessionId, {
             type: 'tool_result',
@@ -2820,7 +2873,7 @@ export function registerChatIpc(getWindow: () => BrowserWindow | null): void {
           resultParts.push({
             type: 'tool_result',
             toolUseId: tc.id,
-            content: truncatedCallResult(tc.name, tc.truncated, truncatedStreak),
+            content: truncatedCallResult(tc.name, tc.truncated, cause, truncatedStreak),
             isError: true
           })
           continue
@@ -3142,7 +3195,9 @@ export function registerChatIpc(getWindow: () => BrowserWindow | null): void {
     }
 
     // 达到步数上限（只有定时任务设了有限上限；主轮与子智能体为 Infinity，走不到这里）。
-    const stepLimit = `已达到单轮最大工具步数（${maxSteps}），已停止。`
+    const stepLimit = isEn()
+      ? `Reached the maximum number of tool steps per turn (${maxSteps}), so the reply was stopped.`
+      : `已达到单轮最大工具步数（${maxSteps}），已停止。`
     emit(turnId, sessionId, { type: 'error', kind: 'server', message: stepLimit })
     return { text: finalText, stopReason: 'end_turn' }
   }
@@ -3517,7 +3572,9 @@ export function registerChatIpc(getWindow: () => BrowserWindow | null): void {
       return {
         stopReason: 'error',
         text: '',
-        errorMessage: '未配置可用的默认模型，无法执行定时任务（请在设置中选定默认模型）。'
+        errorMessage: isEn()
+          ? 'No default model is available, so the scheduled task could not run. Choose a default model in Settings.'
+          : '未配置可用的默认模型，无法执行定时任务（请在设置中选定默认模型）。'
       }
     }
 
@@ -3815,6 +3872,27 @@ export function registerChatIpc(getWindow: () => BrowserWindow | null): void {
     }
     return { ok: true }
   })
+
+  // 重命名对话：写入标题并落盘（索引随之刷新），回传最终标题。清空即恢复自动标题——同首发时的派生规则，
+  // 取首条用户消息（展示用原文，不含随消息附带的提醒）。会话对象全局缓存为同一份，回合进行中改名也不会被
+  // 这一轮后续落盘冲掉；自动派生只在标题为空时写，不会覆盖用户起的名字。不改 updatedAt（改名不算新活动，
+  // 列表顺序不变）。尚未建档的惰性会话查不到 → null。
+  ipcMain.handle(
+    'chat:rename-session',
+    (_e, payload: ChatRenameSessionRequest): { title: string } | null => {
+      const session = getSession(payload.sessionId)
+      if (!session) return null
+      let title = String(payload.title ?? '').replace(/\s+/g, ' ').trim().slice(0, TITLE_MAX)
+      if (!title) {
+        const first = displayOf(session).find((m) => m.role === 'user' && !m.notify)
+        if (first?.role === 'user')
+          title = deriveTitle(first.text) || deriveTitle(first.attachments.map((a) => a.name).join(' '))
+      }
+      session.title = title
+      saveProject(payload.sessionId)
+      return { title }
+    }
+  )
 
   // 左侧会话列表：一次列全部（对话无项目/分桶概念）。IPC 仍收 workspaceRoot 以兼容渲染层调用签名，忽略即可。
   ipcMain.handle(

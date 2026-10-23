@@ -181,8 +181,8 @@ export const toolSpecs: ToolSpec[] = [
   {
     name: 'ask_user',
     description:
-      '向用户提出一个或多个问题并等待其作答——仅在需求有歧义、存在多个各有取舍的可行方案需用户抉择、或缺少无法合理默认的关键信息时使用。' +
-      '能给出合理默认就直接做，不要为琐碎选择打断用户。' +
+      '向用户提出一个或多个问题并等待其作答——仅在卡住时使用：需求有歧义、存在多个各有取舍的可行方案需用户抉择、或缺少无法合理默认的关键信息，且用户的回答会改变你接下来的做法。' +
+      '能自己查证的事实（读文件、跑只读命令即可确认的）不要问；有合理默认的选择也不要问——选最合理的一项直接做，并在回复里说明你的选择。' +
       '可一次问多个相关问题，用户会在同一张卡片里一次性回答全部（避免来回多轮打断）。' +
       '卡片只显示问题和选项，看不到你没写出来的内容：问题若针对草案、方案、改动清单等，先在回复正文里把内容完整写出来，再调用本工具。' +
       '每个问题可给候选项（单选或多选，由 multiSelect 决定）；界面每题都已内置「自己输入」入口（用户点选后才出现输入框），因此不要在 options 里再加「自己输入 / 自定义 / 其他 / 手动输入 / Other」之类的兜底项——那会与内置入口重复。options 只列具体、有意义的选择。' +
@@ -1149,6 +1149,33 @@ function readImageResult(buf: Buffer, mime: ImageMime, abs: string): ToolResult 
   }
 }
 
+/** 系统 / 网络错误码 → 一句话原因（工具失败时界面上红字显示的就是它）。 */
+const ERROR_REASONS: Record<string, string> = {
+  ENOENT: '路径不存在',
+  EACCES: '没有权限',
+  EPERM: '没有权限',
+  EISDIR: '这是目录，不是文件',
+  ENOTDIR: '路径中有一段不是目录',
+  EBUSY: '文件被占用',
+  EEXIST: '已存在',
+  ENOTFOUND: '域名解析失败',
+  ECONNREFUSED: '连接被拒绝',
+  ECONNRESET: '连接被中断',
+  ETIMEDOUT: '连接超时'
+}
+
+/**
+ * 工具抛错时给界面的简短原因（摘要）：常见错误码译成一句话；其余取报错首行、截到 40 字。
+ * 界面直接把它当原因显示（不再加「失败：」前缀），所以不能只写「失败」。fetch 的网络错误码在 cause 上。
+ */
+function errorSummary(e: unknown): string {
+  const err = e as (Error & { code?: string; cause?: { code?: string } }) | undefined
+  const reason = ERROR_REASONS[err?.code ?? ''] ?? ERROR_REASONS[err?.cause?.code ?? '']
+  if (reason) return reason
+  const line = String(err?.message ?? e).split('\n')[0].trim()
+  return line.length > 40 ? `${line.slice(0, 40)}…` : line || '失败'
+}
+
 export async function executeTool(
   name: string,
   args: unknown,
@@ -1445,7 +1472,7 @@ export async function executeTool(
             summary: '超时',
             isError: true
           }
-        return { content: `获取失败：${err?.message ?? String(e)}`, summary: '失败', isError: true }
+        return { content: `获取失败：${err?.message ?? String(e)}`, summary: errorSummary(e), isError: true }
       } finally {
         clearTimeout(timer)
       }
@@ -1786,6 +1813,6 @@ export async function executeTool(
     return { content: `未知工具：${name}`, summary: '未知工具', isError: true }
   } catch (e) {
     const msg = (e as Error)?.message ?? String(e)
-    return { content: `工具执行失败：${msg}`, summary: '失败', isError: true }
+    return { content: `工具执行失败：${msg}`, summary: errorSummary(e), isError: true }
   }
 }

@@ -1,4 +1,13 @@
-import { Fragment, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
+import {
+  Fragment,
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+  useSyncExternalStore
+} from 'react'
 import {
   AlarmClock,
   AlertTriangle,
@@ -107,6 +116,7 @@ import {
   ICONRAIL_W,
   ICONRAIL_W_MAC,
   ResizeHandle,
+  SIDEBAR_COLLAPSE_AT,
   SIDEBAR_DEFAULT,
   clampComposer,
   clampSidebar,
@@ -128,6 +138,7 @@ import {
   BlockView,
   CompactionNotice,
   DeliveryCards,
+  LiveThinkingWindow,
   ProcessFold,
   StatusIndicator,
   Timeline,
@@ -310,6 +321,7 @@ export function ChatFirstShell(): React.JSX.Element {
     newSession,
     selectSession,
     deleteSession,
+    renameSession,
     deleteSessions,
     deleteTurns,
     currentBinding,
@@ -341,6 +353,77 @@ export function ChatFirstShell(): React.JSX.Element {
   const sidebarShown = clampSidebar(sidebarW, viewport.w, railW)
   const sidebarRef = useRef(sidebarShown)
   sidebarRef.current = sidebarShown
+  // 收起会话列表：只有「对话」页能收起（角色页右侧只是资料卡，收起没意义；定时任务 / 机器人页本就占满）。
+  // 收起状态记住（切页再回来、重启都保持）。收起时悬停「对话」图标，列表整块浮在对话区上方（peek），
+  // 点会话即切过去（列表留着，可以接着点别的，鼠标离开才收回）——不用先展开就能换对话。
+  const [listCollapsed, setListCollapsed] = useState(() => loadLayout().sidebarCollapsed ?? false)
+  const collapsed = railTab === 'chats' && listCollapsed
+  const [peek, setPeek] = useState(false)
+  const peekTimer = useRef<number | null>(null)
+  const clearPeekTimer = (): void => {
+    if (peekTimer.current !== null) window.clearTimeout(peekTimer.current)
+    peekTimer.current = null
+  }
+  const setCollapsed = (next: boolean): void => {
+    clearPeekTimer()
+    setPeek(false)
+    setListCollapsed(next)
+    saveLayout({ sidebarCollapsed: next || undefined })
+  }
+  // 浮出：停 0.2 秒才浮出（鼠标路过不弹）；离开图标与列表 0.15 秒才收回（从图标移到列表要穿过图标栏右侧
+  // 约 9px 的空白；再长收回就显得拖沓。同「新建对话」悬停菜单的 0.14 秒）。
+  // 已浮出时再进入只取消待收回、不排定时器——否则点了会话（收回）后排着的定时器会把它重新打开。
+  const peekEnter = (): void => {
+    if (!collapsed) return
+    clearPeekTimer()
+    if (!peek) peekTimer.current = window.setTimeout(() => setPeek(true), 200)
+  }
+  // 进入浮出的列表：只取消待收回。浮出只由悬停「对话」图标触发——收起过程中（或刚拖动收起）鼠标还停在
+  // 列表上，不该因此又浮出来。
+  const peekHover = useRef(false)
+  const peekStay = (): void => {
+    peekHover.current = true
+    if (peek) clearPeekTimer()
+  }
+  // 正在浮出列表的输入框（搜索框、菜单里的筛选框）里打字：打字时鼠标常挪开、输入法候选框也会盖到指针上，
+  // 这时不因鼠标离开而收回，等焦点离开输入框再说（见 peekFocusOut）。
+  const typingInPeek = (): boolean => {
+    const el = document.activeElement
+    return el instanceof HTMLInputElement && el.closest('.cf-rail.is-peek') !== null
+  }
+  const peekLeave = (): void => {
+    peekHover.current = false
+    if (!collapsed) return
+    clearPeekTimer()
+    peekTimer.current = window.setTimeout(() => {
+      if (!typingInPeek()) setPeek(false)
+    }, 150)
+  }
+  // 焦点离开浮出列表里的输入框（点了别处、切走窗口）：鼠标也不在列表上就收回。
+  const peekFocusOut = (): void => {
+    if (peek && !peekHover.current) setPeek(false)
+  }
+  useEffect(() => clearPeekTimer, [])
+  // 离开对话页：收回浮出列表。切换对话不收回——可以连着点开几个看，鼠标离开列表才收回。
+  useEffect(() => {
+    clearPeekTimer()
+    setPeek(false)
+  }, [railTab])
+  // Esc 收回浮出列表；Ctrl+B / ⌘B 在对话页收起 / 展开会话列表。
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent): void => {
+      if (e.key === 'Escape' && peek) {
+        clearPeekTimer()
+        setPeek(false)
+      } else if ((e.ctrlKey || e.metaKey) && !e.altKey && !e.shiftKey && e.code === 'KeyB' && railTab === 'chats') {
+        e.preventDefault()
+        setCollapsed(!listCollapsed)
+      }
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [peek, railTab, listCollapsed])
   /**
    * 「角色」tab 当前选中的角色（右侧显示其资料卡）。仅当 railTab==='roster' 时生效——右侧内容整体由
    * railTab 决定，故「消息」tab 与「角色」tab 各自记住自己的右侧（当前对话 / 当前角色），彼此独立、
@@ -475,6 +558,19 @@ export function ChatFirstShell(): React.JSX.Element {
       if (ok) deleteSession(id)
     })()
   }
+  // 重命名对话：居中输入框，预填当前标题并全选。没改不让提交；清空也可提交（= 恢复自动标题）。
+  const renameThread = (id: string, title: string): void => {
+    void (async () => {
+      const next = await dialog.prompt({
+        title: t('cf.renameChatTitle'),
+        defaultValue: title,
+        placeholder: t('cf.renamePlaceholder'),
+        confirmText: t('cf.renameChat'),
+        validate: (v) => v.replace(/\s+/g, ' ').trim() !== title
+      })
+      if (next !== null) renameSession(id, next)
+    })()
+  }
   // 按「轮」删除当前对话的选中轮次（同步删上下文）：先弹居中破坏性确认，确认后走 store.deleteTurns。
   // 返回是否已删——Conversation 据此退出选择态并清空选择（未确认则保持选择态供继续调整）。
   const deleteTurnsWithConfirm = async (indices: number[]): Promise<boolean> => {
@@ -530,27 +626,47 @@ export function ChatFirstShell(): React.JSX.Element {
       {/* 无独立标题栏（微信式）：最小化/最大化/关闭用系统原生窗口控件叠加（titleBarOverlay），
           此处不再自绘按钮，避免与原生按钮重影。拖拽交给图标栏与对话头。 */}
       <div
-        className="cf-body"
+        className={`cf-body${collapsed && peek ? ' is-peeking' : ''}`}
         style={
-          { '--cf-rail-w': `${railW}px`, '--cf-side': `${sidebarShown}px` } as React.CSSProperties
+          {
+            '--cf-rail-w': `${railW}px`,
+            '--cf-side': `${collapsed ? 0 : sidebarShown}px`,
+            '--cf-side-open': `${sidebarShown}px`
+          } as React.CSSProperties
         }
       >
-        {/* 面板右缘拖拽手柄（覆盖在分隔线上，绝对定位不占网格单元）；定时任务 tab 的列表列同宽同享。 */}
-        <ResizeHandle
-          axis="x"
-          value={sidebarShown}
-          title={t('cf.resizeSidebar')}
-          style={{ left: `calc(${railW}px + ${sidebarShown}px)` }}
-          onChange={(v) => setSidebarW(clampSidebar(v, window.innerWidth, railW))}
-          onCommit={() => saveLayout({ sidebarWidth: sidebarRef.current })}
-          onReset={() => {
-            setSidebarW(SIDEBAR_DEFAULT)
-            saveLayout({ sidebarWidth: undefined })
-          }}
-        />
+        {/* 面板右缘拖拽手柄（覆盖在分隔线上，绝对定位不占网格单元）；定时任务 tab 的列表列同宽同享。
+            对话页：往左拖过下限继续拖即收起（手柄随之卸下、这次拖动结束）。收起后不显示手柄：往外拖要拖够
+            距离才生效、中间没有跟手的反馈，展开交给「对话」图标 / Ctrl+B。 */}
+        {!collapsed && (
+          <ResizeHandle
+            axis="x"
+            value={sidebarShown}
+            title={t('cf.resizeSidebar')}
+            style={{ left: `calc(${railW}px + ${sidebarShown}px)` }}
+            onChange={(v) => {
+              if (railTab === 'chats' && v < SIDEBAR_COLLAPSE_AT) {
+                // 收起后手柄卸下、不再走 onCommit：拖到下限前改过的宽度在这里落盘。
+                saveLayout({ sidebarWidth: sidebarRef.current })
+                setCollapsed(true)
+                return
+              }
+              setSidebarW(clampSidebar(v, window.innerWidth, railW))
+            }}
+            onCommit={() => saveLayout({ sidebarWidth: sidebarRef.current })}
+            onReset={() => {
+              setSidebarW(SIDEBAR_DEFAULT)
+              saveLayout({ sidebarWidth: undefined })
+            }}
+          />
+        )}
         <IconRail
           tab={railTab}
-          onTab={setRailTab}
+          // 点亮着的「对话」图标 = 收起 / 展开会话列表；点别的图标照常切页。
+          onTab={(tab) => (tab === 'chats' && railTab === 'chats' ? setCollapsed(!listCollapsed) : setRailTab(tab))}
+          listCollapsed={collapsed}
+          onChatsHover={peekEnter}
+          onChatsLeave={peekLeave}
           onOpenSettings={() => setSettingsOpen(true)}
           chatAlert={chatAlert}
         />
@@ -580,9 +696,15 @@ export function ChatFirstShell(): React.JSX.Element {
               onAddPersona={() => setEditor({ mode: 'create' })}
               onAddPersonaByChat={addPersonaByChat}
               onNewChatFromThread={newChatFromThread}
+              onRenameThread={renameThread}
               onDeleteThread={deleteThread}
               onDeletePersona={deletePersona}
               onReorderPersonas={reorderPersonas}
+              collapsed={collapsed}
+              peek={collapsed && peek}
+              onHover={peekStay}
+              onLeave={peekLeave}
+              onInputBlur={peekFocusOut}
             />
             {railTab === 'roster' ? (
               // 「角色」tab：右侧显示选中角色的资料卡；未选中（或角色已删）则给出提示。
@@ -642,17 +764,29 @@ export function ChatFirstShell(): React.JSX.Element {
 function IconRail({
   tab,
   onTab,
+  listCollapsed,
+  onChatsHover,
+  onChatsLeave,
   onOpenSettings,
   chatAlert
 }: {
   tab: RailTab
+  /** 点亮着的「对话」图标也回调（由调用方切换会话列表的收起 / 展开）。 */
   onTab: (t: RailTab) => void
+  /** 对话页的会话列表已收起：「对话」图标的提示改为「展开会话列表」，红点也显示在它上面。 */
+  listCollapsed: boolean
+  /** 悬停 / 离开「对话」图标（收起时据此浮出列表）。 */
+  onChatsHover: () => void
+  onChatsLeave: () => void
   onOpenSettings: () => void
   /** 其他对话有新消息或待你处理 → 按钮上显示红点。 */
   chatAlert: boolean
 }): React.JSX.Element {
   const { t } = useI18n()
   const [profileOpen, setProfileOpen] = useState(false)
+  // 亮着的「对话」图标点了是收起 / 展开，提示写明，免得点了以为列表丢了。
+  const chatsLabel =
+    tab !== 'chats' ? t('cf.tabChats') : listCollapsed ? t('cf.expandList') : t('cf.collapseList')
   return (
     <nav className="cf-iconrail">
       <button
@@ -667,14 +801,17 @@ function IconRail({
       {profileOpen && <ProfilePanel onClose={() => setProfileOpen(false)} />}
       <button
         className={`cf-navbtn${tab === 'chats' ? ' is-active' : ''}`}
-        title={t('cf.tabChats')}
-        aria-label={t('cf.tabChats')}
+        title={chatsLabel}
+        aria-label={chatsLabel}
         aria-current={tab === 'chats'}
+        aria-expanded={tab === 'chats' ? !listCollapsed : undefined}
         onClick={() => onTab('chats')}
+        onMouseEnter={onChatsHover}
+        onMouseLeave={onChatsLeave}
       >
         <MessageCircle size={20} />
-        {/* 不在对话页时，才在导航按钮上提示其他对话的动静（在对话页时列表头像已能看到）。 */}
-        {tab !== 'chats' && chatAlert && (
+        {/* 看不到会话列表时（不在对话页，或列表已收起），在导航按钮上提示其他对话的动静。 */}
+        {(tab !== 'chats' || listCollapsed) && chatAlert && (
           <span className="cf-navbtn__dot" aria-hidden="true" />
         )}
       </button>
@@ -737,9 +874,15 @@ function Rail({
   onAddPersona,
   onAddPersonaByChat,
   onNewChatFromThread,
+  onRenameThread,
   onDeleteThread,
   onDeletePersona,
-  onReorderPersonas
+  onReorderPersonas,
+  collapsed,
+  peek,
+  onHover,
+  onLeave,
+  onInputBlur
 }: {
   tab: 'chats' | 'roster'
   sessions: SessionMeta[]
@@ -754,9 +897,20 @@ function Rail({
   onAddPersona: () => void
   onAddPersonaByChat: () => void
   onNewChatFromThread: (id: string) => void
+  /** 重命名对话（弹框输入新标题）；title 为当前标题。 */
+  onRenameThread: (id: string, title: string) => void
   onDeleteThread: (id: string, title: string) => void
   onDeletePersona: (id: string, name: string) => void
   onReorderPersonas: (ids: string[]) => void
+  /** 会话列表已收起（列宽归零、列表藏在对话区下面）。 */
+  collapsed: boolean
+  /** 收起时浮出：整块浮在对话区上方。 */
+  peek: boolean
+  /** 鼠标进出列表（浮出时据此决定收回）。右键菜单、新建菜单都是列表的子元素，停在上面不算离开。 */
+  onHover: () => void
+  onLeave: () => void
+  /** 焦点离开列表里的输入框（且没落在列表内别处）：浮出时据此决定收回。 */
+  onInputBlur: () => void
 }): React.JSX.Element {
   const { t } = useI18n()
   // 右键菜单态（对话/角色行共用一个，同一时刻至多一个）。
@@ -772,6 +926,17 @@ function Rail({
   useEffect(() => {
     setQuery('')
   }, [tab])
+  const asideRef = useRef<HTMLElement>(null)
+  // 收起后浮出列表收回时：连带关掉在它里面打开的右键菜单（否则菜单留在隐藏的列表里，下次浮出时它的全屏
+  // 透明背板跟着回来，第一下点击被背板吃掉）；清空搜索词（浮出列表是临时的，下次浮出不该还是筛过的样子）；
+  // 焦点若还在列表里（如搜索框）也移走，免得接着打字打进看不见的框。
+  useEffect(() => {
+    if (!collapsed || peek) return
+    setMenu(null)
+    setQuery('')
+    const el = document.activeElement
+    if (el instanceof HTMLElement && asideRef.current?.contains(el)) el.blur()
+  }, [collapsed, peek])
   // 归一化后的检索词（去空白 + 小写）；空则视为不过滤。
   const q = query.trim().toLowerCase()
   // 消息列表按最近更新降序，再按检索词过滤（标题 + 所属角色名，均大小写不敏感）。
@@ -814,7 +979,17 @@ function Rail({
     onReorderPersonas([id, ...ids.filter((x) => x !== id)])
   }
   return (
-    <aside className="cf-rail">
+    <aside
+      ref={asideRef}
+      className={`cf-rail${collapsed ? ' is-collapsed' : ''}${peek ? ' is-peek' : ''}`}
+      aria-hidden={collapsed && !peek ? true : undefined}
+      onMouseEnter={onHover}
+      onMouseLeave={onLeave}
+      onBlur={(e) => {
+        const to = e.relatedTarget
+        if (e.target instanceof HTMLInputElement && !(to instanceof Node && e.currentTarget.contains(to))) onInputBlur()
+      }}
+    >
       {/* 顶部：搜索占满整行；消息 tab 并排「新建对话」入口（悬停出角色列表），角色 tab 并排「添加角色」入口（悬停/点击出二选一弹层）。 */}
       <div className="cf-rail__top">
         <div className="cf-search">
@@ -849,6 +1024,7 @@ function Rail({
         )}
       </div>
 
+      {/* 角色 tab：角色为空只会是还没加载完（默认角色 Deva 删不掉），先留空，不落到「未找到匹配项」。 */}
       <div className="cf-list">
         {tab === 'chats' ? (
           ordered.length === 0 ? (
@@ -875,9 +1051,7 @@ function Rail({
               />
             ))
           )
-        ) : personas.length === 0 ? (
-          <div className="cf-empty">{t('cf.noPersona')}</div>
-        ) : shownPersonas.length === 0 ? (
+        ) : personas.length === 0 ? null : shownPersonas.length === 0 ? (
           <div className="cf-empty">{t('cf.searchNoResults')}</div>
         ) : (
           shownPersonas.map((p) => (
@@ -918,6 +1092,11 @@ function Rail({
                     label: t('cf.newChat'),
                     icon: <Plus size={14} />,
                     onClick: () => onNewChatFromThread(menu.id)
+                  },
+                  {
+                    label: t('cf.renameChat'),
+                    icon: <Pencil size={14} />,
+                    onClick: () => onRenameThread(menu.id, menu.title)
                   },
                   {
                     label: t('cf.deleteChat'),
@@ -1969,6 +2148,7 @@ function ThreadRow({
 }): React.JSX.Element {
   const { t } = useI18n()
   const rel = useRelativeTime()
+  const draft = useDraftPreview(session.id)
   // 任务独占会话（sessionId = `task-…`）：行上打一枚静态「⏰ 定时」徽标以区别普通对话。
   // 「有新运行未读」（state.unread）与待你处理（state.attention）都在头像右上角打红点。
   const isTask = session.id.startsWith('task-')
@@ -1998,7 +2178,15 @@ function ThreadRow({
           )}
           <span className="cf-thread__time">{rel(session.updatedAt)}</span>
         </div>
-        <div className="cf-thread__owner">{owner?.name ?? ''}</div>
+        {/* 这个会话里有没发出的内容（且不是正在看的会话）：下行换成红色「[草稿]」+ 内容开头，提醒切回去接着写。 */}
+        {draft && !active ? (
+          <div className="cf-thread__owner">
+            <span className="cf-thread__draft">{t('cf.draftTag')}</span>
+            {draft}
+          </div>
+        ) : (
+          <div className="cf-thread__owner">{owner?.name ?? ''}</div>
+        )}
       </div>
     </button>
   )
@@ -2077,7 +2265,7 @@ function PersonaRow({
 /**
  * 左侧对话被清空后中列的落点：列出花名册全部角色，点头像/卡片直接与该角色开启新对话
  * （onStart → startWith：新建并落盘一条绑定该角色的空对话，随即切入消息视图）。
- * 花名册为空时给出「先去添加角色」的提示（与角色 tab 空态一致）。
+ * 默认角色 Deva 删不掉，花名册只在加载完成前为空，此时网格先留空。
  */
 function QuickStart({
   personas,
@@ -2094,24 +2282,20 @@ function QuickStart({
         <div className="cf-quick__inner">
           <div className="cf-quick__title">{t('cf.quickStartTitle')}</div>
           <div className="cf-quick__hint">{t('cf.quickStartHint')}</div>
-          {personas.length === 0 ? (
-            <div className="cf-empty">{t('cf.noPersona')}</div>
-          ) : (
-            <div className="cf-quick__grid">
-              {personas.map((p) => (
-                <button
-                  key={p.id}
-                  className="cf-qcard"
-                  onClick={() => onStart(p.id)}
-                  title={p.desc || p.name}
-                >
-                  <Avatar persona={p} size={48} />
-                  <span className="cf-qcard__name">{p.name}</span>
-                  {p.desc && <span className="cf-qcard__desc">{p.desc}</span>}
-                </button>
-              ))}
-            </div>
-          )}
+          <div className="cf-quick__grid">
+            {personas.map((p) => (
+              <button
+                key={p.id}
+                className="cf-qcard"
+                onClick={() => onStart(p.id)}
+                title={p.desc || p.name}
+              >
+                <Avatar persona={p} size={48} />
+                <span className="cf-qcard__name">{p.name}</span>
+                {p.desc && <span className="cf-qcard__desc">{p.desc}</span>}
+              </button>
+            ))}
+          </div>
         </div>
       </div>
     </main>
@@ -3229,10 +3413,23 @@ function Conversation({
   // 底部工作状态行。本轮已有「工作过程」折叠条时，常规的「正在做什么 + 计时」已在折叠条里，只剩等待作答 /
   // 重连 / 压缩这些特殊状态；它们放进这条消息的末尾，紧跟步骤与卡片——放在消息列表下面的话，进行中消息底部
   // 撑住的空白（见 ConvMessage）会把它和上面的步骤隔开。还没有折叠条时照常放在列表下方。
+  // 回复还什么都没出（请求中）时也放进这条消息，就在角色名下面、正文将出现的位置，显示为三个跳动的点；
+  // 正文或思考一到即被替换。
   const lastMsg = messages[messages.length - 1]
   const folded = streaming && lastMsg?.role === 'assistant' && hasProcess(lastMsg.blocks)
+  const blank =
+    streaming &&
+    lastMsg?.role === 'assistant' &&
+    lastMsg.blocks.every((b) => b.kind === 'step' || (b.kind === 'text' && !b.text.trim()))
+  const statusInMsg = folded || blank
   const statusLine = streaming ? (
-    <StatusIndicator activity={deriveActivity(messages)} status={streamStatus} folded={folded} onStop={onStop} />
+    <StatusIndicator
+      activity={deriveActivity(messages)}
+      status={streamStatus}
+      folded={folded}
+      pending={blank}
+      onStop={onStop}
+    />
   ) : null
 
   // 单条消息渲染（选择态与常态复用；选择态下 active 恒 false，因选择只在非流式时可用）。
@@ -3245,7 +3442,7 @@ function Conversation({
       active={!selecting && streaming && i === messages.length - 1}
       latest={i === messages.length - 1}
       elapsedSec={i === messages.length - 1 ? streamStatus.elapsedSec : 0}
-      footer={folded && !selecting && i === messages.length - 1 ? statusLine : undefined}
+      footer={statusInMsg && !selecting && i === messages.length - 1 ? statusLine : undefined}
       dataTurn={turn}
       onAsk={onAsk}
       onPlan={onPlan}
@@ -3316,7 +3513,7 @@ function Conversation({
             ) : (
               <>
                 {messages.map((m, i) => renderMsg(m, i, turnOf[i]))}
-                {!folded && statusLine}
+                {!statusInMsg && statusLine}
                 {/* 已有对话但模型被删光：引导卡接在末尾（不进对话记录）。 */}
                 {needModelSetup && !streaming && <ModelSetupCard />}
               </>
@@ -3389,6 +3586,7 @@ function Conversation({
         </div>
       ) : (
         <Composer
+          sessionId={currentSessionId}
           owner={owner}
           streaming={streaming}
           focusRoot={focusRoot}
@@ -3597,7 +3795,7 @@ function ConvMessage({
   latest: boolean
   /** 本轮已用秒数（进行中的折叠条标题末尾显示；只对 active 的消息有意义）。 */
   elapsedSec: number
-  /** 接在消息内容末尾的底部状态行（等待作答 / 重连 / 压缩；只交给进行中且已有折叠条的那条）。 */
+  /** 接在消息内容末尾的底部状态行（只交给进行中的那条：已有折叠条时是等待作答 / 重连 / 压缩，还没内容时是思考中）。 */
   footer?: React.ReactNode
   /** 该消息所属的对话轮下标（0 基）；标注在根节点上，供右键菜单定位「删除此轮」。前言/未知为 undefined。 */
   dataTurn?: number
@@ -3729,24 +3927,34 @@ function ConvMessage({
     )
   // 思考 / 工具调用等过程收进「工作过程」折叠条，名片等固定块与回复正文留在外面（见 splitProcess）；
   // 交付卡在回合结束后排在最后（见 DeliveryCards）。
-  // 进行中同样默认收起，收起时折叠条下露出当前步骤（并行执行的一并列出，最多 5 行，见 currentSteps）。
+  // 进行中同样默认收起，收起时折叠条下露出当前步骤（并行执行的一并列出，最多 5 行，见 currentSteps）；
+  // 最近一步之后已在输出正文或出了卡片时不露。
+  // 当前步骤正是流式输出中的思考：折叠条标题直接写「思考中」，下面只露实时小窗，不再重复一行「思考中」
+  // 节点（点折叠条展开整条时间轴即可看全文）。
   const split = splitProcess(msg.blocks, active)
+  const current = split && active ? currentSteps(msg.blocks) : []
+  const step = current.length === 1 ? current[0] : undefined
+  const liveThinking = step?.kind === 'thinking' && step === liveBlock ? step : undefined
   const preview =
-    split && active ? (
-      <Timeline
-        steps={currentSteps(split.process).map((b) => ({ block: b, index: msg.blocks.indexOf(b) }))}
-        liveBlock={liveBlock}
-        compact
-        limit={5}
-      />
+    current.length > 0 ? (
+      liveThinking ? (
+        liveThinking.text.trim() && <LiveThinkingWindow text={liveThinking.text} />
+      ) : (
+        <Timeline
+          steps={current.map((b) => ({ block: b, index: msg.blocks.indexOf(b) }))}
+          liveBlock={liveBlock}
+          compact
+          limit={5}
+        />
+      )
     ) : undefined
+  // 有工作过程时，角色名与折叠条同一行（「Deva › 已处理 … · N 步」）；没有时单独一行。
+  const name = <span className="cf-msg__name">{owner?.name ?? t('cf.assistant')}</span>
   return (
     <div className="cf-msg" data-turn={dataTurn}>
       <Avatar persona={owner} size={32} />
       <div className="cf-msg__body">
-        <div className="cf-msg__head">
-          <span className="cf-msg__name">{owner?.name ?? t('cf.assistant')}</span>
-        </div>
+        {!split && <div className="cf-msg__head">{name}</div>}
         <div
           className="msg__content"
           ref={contentRef}
@@ -3760,10 +3968,12 @@ function ConvMessage({
                 blocks={split.process}
                 durationMs={msg.durationMs}
                 live={active}
+                thinking={Boolean(liveThinking)}
                 elapsedSec={active ? elapsedSec : undefined}
                 preview={preview}
                 open={processOpen}
                 onToggle={() => setProcessOpen((v) => !v)}
+                lead={name}
               >
                 {renderBlocks(split.process, true)}
               </ProcessFold>
@@ -3800,7 +4010,40 @@ function slashQueryOf(input: string): string | null {
   return m ? m[1] : null
 }
 
+/**
+ * 各会话未发送的输入（正文 + 待发附件），按会话 id 存在内存里：切走时存下、切回来接着写，也不会把 A 会话
+ * 没写完的内容带到 B。只存非空的；不落盘，重启应用后清空。
+ * 会话列表据此在其他会话行上显示「[草稿] …」（见 useDraftPreview）：只在进出会话时变动，打字不刷新列表。
+ */
+type ComposerDraft = { text: string; pending: Picked[] }
+const composerDrafts = new Map<string, ComposerDraft>()
+const draftListeners = new Set<() => void>()
+
+/** 写入（null = 清除）某会话的草稿，并通知会话列表。 */
+function setComposerDraft(id: string, draft: ComposerDraft | null): void {
+  if (draft) composerDrafts.set(id, draft)
+  else if (!composerDrafts.delete(id)) return
+  for (const notify of draftListeners) notify()
+}
+
+function subscribeDrafts(onChange: () => void): () => void {
+  draftListeners.add(onChange)
+  return () => {
+    draftListeners.delete(onChange)
+  }
+}
+
+/** 某会话草稿的一行摘要：正文（空白归一），只有附件时为附件名；没有草稿为 null。 */
+function useDraftPreview(id: string): string | null {
+  return useSyncExternalStore(subscribeDrafts, () => {
+    const d = composerDrafts.get(id)
+    if (!d) return null
+    return d.text.replace(/\s+/g, ' ').trim() || d.pending.map((p) => p.name).join(' ') || null
+  })
+}
+
 function Composer({
+  sessionId,
   owner,
   streaming,
   focusRoot,
@@ -3813,6 +4056,8 @@ function Composer({
   prefill,
   onPrefillConsumed
 }: {
+  /** 当前会话：输入框里的草稿按它分开保存（见 composerDrafts）。 */
+  sessionId: string
   owner?: Persona
   streaming: boolean
   focusRoot: string | null
@@ -3828,8 +4073,13 @@ function Composer({
 }): React.JSX.Element {
   const { t, locale } = useI18n()
   const { skills } = useExtensions()
+  const toast = useToast()
   const [input, setInput] = useState('')
   const [pending, setPending] = useState<Picked[]>([])
+  const pendingRef = useRef(pending)
+  pendingRef.current = pending
+  const sessionRef = useRef(sessionId)
+  sessionRef.current = sessionId
   // 输入框高度：固定高、不随内容长高，内容多了框内滚动；只能靠顶边手柄拖动调整。
   // 与侧栏同理，存用户意图值、渲染时按窗口高再夹取。
   const viewport = useViewport()
@@ -3922,49 +4172,83 @@ function Composer({
     })()
   }
 
-  const pickFiles = async (): Promise<void> => {
-    if (streaming) return
-    const picked = (await window.deva.fs.pickAttachments()) as Picked[]
-    if (!picked.length) return
+  // 新增附件并入 pending：不支持 / 过大的不加入（加了也发不出去），toast 说明哪些被跳过；按路径去重。
+  const addPicked = (picked: Picked[]): void => {
+    const bad = picked.filter((p) => !p.supported)
+    if (bad.length) {
+      const names = bad.map((p) => p.name).join(locale === 'en' ? ', ' : '、')
+      toast.show({ variant: 'warning', message: t('cf.attachSkipped').replace('{names}', names) })
+    }
     setPending((prev) => {
       const seen = new Set(prev.map((p) => p.path))
-      return [...prev, ...picked.filter((p) => !seen.has(p.path))]
+      const out = [...prev]
+      for (const p of picked) {
+        if (!p.supported || seen.has(p.path)) continue
+        seen.add(p.path)
+        out.push(p)
+      }
+      return out
     })
   }
 
-  // 粘贴图片 / 文档：与「附加文件」同一条链路（主进程授权 → pending 附件条）。
+  const pickFiles = async (): Promise<void> => {
+    if (streaming) return
+    addPicked((await window.deva.fs.pickAttachments()) as Picked[])
+  }
+
+  // 粘贴 / 拖入的文件：与「附加文件」同一条链路（主进程落盘授权 → pending 附件条）。
+  // 只交字节不交路径，渲染层仍无法让主进程读任意路径；拖入的文件夹读不出字节，直接跳过。
+  const addFiles = async (files: File[]): Promise<void> => {
+    const results = await Promise.allSettled(
+      files.map(async (f) =>
+        window.deva.fs.pasteAttachment({
+          name: f.name,
+          mime: f.type,
+          size: f.size,
+          // 超过最大附件上限（PDF 20MB）的不读字节，只报体积，主进程据此判「过大」。
+          data: f.size > 20 * 1024 * 1024 ? null : new Uint8Array(await f.arrayBuffer())
+        })
+      )
+    )
+    // 同一文件多次粘贴 / 拖入只留一份：主进程按内容去重、重复的返回同一路径，addPicked 按路径过滤即可。
+    addPicked(results.flatMap((r) => (r.status === 'fulfilled' ? [r.value as Picked] : [])))
+  }
+
   // 剪贴板带纯文本时一律按文本粘贴——Word / Excel 复制内容会顺带一张渲染图，不能把它变成附件。
   const onPaste = (e: ClipboardEvent): boolean => {
     const files = Array.from(e.clipboardData?.files ?? [])
     if (!files.length || e.clipboardData?.getData('text/plain')) return false
     e.preventDefault()
-    if (streaming) return true
-    void (async () => {
-      const picked = await Promise.all(
-        files.map(async (f) =>
-          window.deva.fs.pasteAttachment({
-            name: f.name,
-            mime: f.type,
-            size: f.size,
-            // 超过最大附件上限（PDF 20MB）的不读字节，只报体积，主进程据此判「过大」。
-            data: f.size > 20 * 1024 * 1024 ? null : new Uint8Array(await f.arrayBuffer())
-          })
-        )
-      )
-      // 同一文件多次粘贴只留一份：主进程按内容去重、重复粘贴返回同一路径，此处按路径过滤即可。
-      setPending((prev) => {
-        const seen = new Set(prev.map((p) => p.path))
-        const out = [...prev]
-        for (const p of picked as Picked[]) {
-          if (seen.has(p.path)) continue
-          seen.add(p.path)
-          out.push(p)
-        }
-        return out
-      })
-    })()
+    if (!streaming) void addFiles(files)
     return true
   }
+
+  // 拖入文件：整个窗口都可放下，一律转成附件。Chromium 对未拦截的文件拖放默认「打开该文件」
+  // （导航离开应用），故凡带文件的 dragover / drop 都 preventDefault；回复中只拦截不附加，同粘贴。
+  const addFilesRef = useRef(addFiles)
+  addFilesRef.current = addFiles
+  const streamingRef = useRef(streaming)
+  streamingRef.current = streaming
+  useEffect(() => {
+    const hasFiles = (e: DragEvent): boolean => Boolean(e.dataTransfer?.types.includes('Files'))
+    const onDragOver = (e: DragEvent): void => {
+      if (!hasFiles(e)) return
+      e.preventDefault()
+      if (e.dataTransfer) e.dataTransfer.dropEffect = streamingRef.current ? 'none' : 'copy'
+    }
+    const onDrop = (e: DragEvent): void => {
+      if (!hasFiles(e)) return
+      e.preventDefault()
+      const files = Array.from(e.dataTransfer?.files ?? [])
+      if (files.length && !streamingRef.current) void addFilesRef.current(files)
+    }
+    window.addEventListener('dragover', onDragOver)
+    window.addEventListener('drop', onDrop)
+    return () => {
+      window.removeEventListener('dragover', onDragOver)
+      window.removeEventListener('drop', onDrop)
+    }
+  }, [])
 
   const removePending = (path: string): void =>
     setPending((prev) => prev.filter((p) => p.path !== path))
@@ -3979,6 +4263,7 @@ function Composer({
       return
     }
     const prevPending = pending
+    const sid = sessionId
     composer.setText('')
     composer.clearHistory()
     setPending([])
@@ -3986,8 +4271,13 @@ function Composer({
       text,
       atts.map((p) => ({ path: p.path, name: p.name, kind: p.kind as AttachKind }))
     ).then((sent) => {
-      // 未发出（未选模型 / 请求失败，原因已 toast）：把草稿放回——但别覆盖用户在此期间新敲的内容。
+      // 未发出（未选模型 / 请求失败，原因已 toast）：把草稿放回——但别覆盖用户在此期间新敲的内容；
+      // 此间已切到别的会话的，放回原会话的草稿里。
       if (sent) return
+      if (sessionRef.current !== sid) {
+        if (!composerDrafts.has(sid)) setComposerDraft(sid, { text, pending: prevPending })
+        return
+      }
       if (!composer.getText()) composer.setText(text)
       setPending((cur) => (cur.length ? cur : prevPending))
     })
@@ -4058,6 +4348,23 @@ function Composer({
   // 判定依据（技能启停、有无附件）变了而文本没变：重新识别一次开头指令。
   // eslint-disable-next-line react-hooks/exhaustive-deps
   useEffect(() => composer.refreshToken(), [skills, noAtts])
+
+  // 草稿按会话分开：进入会话（含挂载）换上它的草稿，没有则清空；离开（切换会话或卸载，如进入选择删除）时
+  // 把当前内容存到它名下。撤销历史一并清掉，免得撤销把别的会话的内容找回来。用 layout effect，切过去时
+  // 不会先闪一下上一个会话的文字。
+  useLayoutEffect(() => {
+    const draft = composerDrafts.get(sessionId)
+    setComposerDraft(sessionId, null)
+    composer.setText(draft?.text ?? '')
+    composer.clearHistory()
+    setPending(draft?.pending ?? [])
+    return () => {
+      const text = composer.getText()
+      const kept = pendingRef.current
+      if (text.trim() || kept.length) setComposerDraft(sessionId, { text, pending: kept })
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sessionId])
 
   return (
     <div className="cf-composer">

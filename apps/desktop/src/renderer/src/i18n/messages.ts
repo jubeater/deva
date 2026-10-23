@@ -228,7 +228,7 @@ const zhCN: MessageTree = {
     emptyHint: '描述任务，Deva 会读写项目文件、按需请求授权来完成。',
     error: '出错了',
     notice: {
-      truncated: '回复多次撞上输出长度上限，自动续写仍未完成，已停下。可发送「继续」，或让我把内容拆小、分段写入文件。',
+      truncated: '回复多次撞上输出长度上限或工具参数不完整，自动续写仍未完成，已停下。可发送「继续」，或让我把内容拆小、分段写入文件。',
       empty: '本轮模型没有返回任何内容。可换种说法重试或换个模型；若这轮对话已经很长，也可以新建对话或先压缩上下文。',
       refused: '模型拒绝了本次请求（或被服务商的内容策略拦截），本轮没有返回内容。换种说法或换个模型再试。',
       compacted: '较早的对话已压缩为摘要',
@@ -377,7 +377,6 @@ const zhCN: MessageTree = {
         unknown: '调用'
       },
       failed: '失败',
-      failedWith: '失败：{reason}',
       // 处置过的计划 / 挂载请求收进工作过程后的节点文字。
       plan: {
         approve: '已批准计划',
@@ -392,9 +391,11 @@ const zhCN: MessageTree = {
     },
     process: {
       // 折叠条标题：进行中「处理中 · 7 步」，结束后「已处理 1 分 12 秒 · 7 步」；没记录耗时的旧对话回落为「已执行 7 步」。
+      // 结束后过程里只有一段思考时为「已思考 12 秒」。
       live: '处理中',
       more: '还有 {n} 个在执行',
       worked: '已处理 {d}',
+      thought: '已思考 {d}',
       count: '{n} 步',
       steps: '已执行 {n} 步',
       h: '{n} 小时',
@@ -410,6 +411,7 @@ const zhCN: MessageTree = {
     },
     work: {
       thinking: '思考中',
+      requesting: '等待回复',
       responding: '生成回答中',
       compacting: '正在压缩较早的对话',
       usingTool: '正在调用工具',
@@ -852,14 +854,16 @@ const zhCN: MessageTree = {
     },
     brandTag: '对话优先',
     newChat: '新建对话',
+    draftTag: '[草稿]',
     search: '搜索',
     searchChats: '搜索对话',
     searchRoster: '搜索角色',
     searchNoResults: '未找到匹配项',
     tabChats: '消息',
+    collapseList: '收起会话列表',
+    expandList: '展开会话列表',
     tabRoster: '角色',
     tabTasks: '定时任务',
-    noPersona: '还没有角色，点下方「添加角色」创建一个',
     addPersona: '添加角色',
     addByChat: '通过对话添加',
     addByChatPrompt: '我想创建一个新角色，请一步步引导我明确它的定位、性格与专长，最后用角色名片提交给我确认。',
@@ -1016,6 +1020,7 @@ const zhCN: MessageTree = {
     send: '发送',
     newline: '换行',
     cancel: '取消',
+    attachSkipped: '以下文件类型不支持或过大，未添加：{names}',
     save: '保存',
     prefModel: '偏好模型',
     startChat: '开始对话',
@@ -1026,6 +1031,9 @@ const zhCN: MessageTree = {
     editPersona: '编辑角色',
     delete: '删除',
     deleteChat: '删除对话',
+    renameChat: '重命名',
+    renameChatTitle: '重命名对话',
+    renamePlaceholder: '留空则恢复默认标题',
     pinTop: '置顶',
     deletePersona: '删除角色',
     deleteChatConfirm: '删除后该对话的所有消息将被永久移除，无法恢复。',
@@ -1324,7 +1332,7 @@ const en: MessageTree = {
     emptyHint: 'Describe a task; Deva reads and writes project files, asking permission as needed.',
     error: 'Something went wrong',
     notice: {
-      truncated: 'Replies kept hitting the output length limit and automatic continuation didn’t finish, so I stopped. Send “continue”, or ask me to split the work into smaller pieces.',
+      truncated: 'Replies kept hitting the output length limit or producing incomplete tool arguments, and automatic continuation didn’t finish, so I stopped. Send “continue”, or ask me to split the work into smaller pieces.',
       empty:
         'The model returned nothing this turn. Try rephrasing or another model; if this chat has grown long, start a new one or compact the context first.',
       refused:
@@ -1466,7 +1474,6 @@ const en: MessageTree = {
         unknown: 'Call'
       },
       failed: 'failed',
-      failedWith: 'failed: {reason}',
       plan: {
         approve: 'Approved plan',
         keep: 'Asked to refine plan',
@@ -1482,6 +1489,7 @@ const en: MessageTree = {
       live: 'Working',
       more: '{n} more running',
       worked: 'Worked for {d}',
+      thought: 'Thought for {d}',
       count: '{n} steps',
       steps: '{n} steps',
       h: '{n}h',
@@ -1497,6 +1505,7 @@ const en: MessageTree = {
     },
     work: {
       thinking: 'Thinking',
+      requesting: 'Waiting for response',
       responding: 'Responding',
       compacting: 'Compacting earlier conversation',
       usingTool: 'Using tool',
@@ -1952,14 +1961,16 @@ const en: MessageTree = {
     },
     brandTag: 'Chat-first',
     newChat: 'New chat',
+    draftTag: '[Draft]',
     search: 'Search',
     searchChats: 'Search chats',
     searchRoster: 'Search personas',
     searchNoResults: 'No matches',
     tabChats: 'Chats',
+    collapseList: 'Collapse conversation list',
+    expandList: 'Expand conversation list',
     tabRoster: 'Roster',
     tabTasks: 'Tasks',
-    noPersona: 'No personas yet — click “Add persona” below to create one',
     addPersona: 'Add persona',
     addByChat: 'Add via chat',
     addByChatPrompt:
@@ -2114,6 +2125,7 @@ const en: MessageTree = {
     send: 'Send',
     newline: 'newline',
     cancel: 'Cancel',
+    attachSkipped: 'Skipped unsupported or oversized files: {names}',
     save: 'Save',
     prefModel: 'Preferred model',
     startChat: 'Start chat',
@@ -2124,6 +2136,9 @@ const en: MessageTree = {
     editPersona: 'Edit persona',
     delete: 'Delete',
     deleteChat: 'Delete conversation',
+    renameChat: 'Rename',
+    renameChatTitle: 'Rename conversation',
+    renamePlaceholder: 'Leave empty to restore the default title',
     pinTop: 'Pin to top',
     deletePersona: 'Delete persona',
     deleteChatConfirm:
